@@ -4,6 +4,7 @@ import (
 	"code.google.com/p/go-charset/charset"
 	_ "code.google.com/p/go-charset/data"
 	"encoding/xml"
+	"errors"
 	"flag"
 	"strconv"
 	//"fmt"
@@ -17,9 +18,12 @@ import (
 )
 
 type config struct {
-	RiemanHost string
-	RiemanPort int
-	Clusters   []ClusterConfig
+	RiemannHost string
+	RiemannPort int
+	Timeout     int
+	Retries     int
+	EventQueue  int
+	Clusters    []ClusterConfig
 }
 
 type ClusterConfig struct {
@@ -75,9 +79,6 @@ type ExtraElement struct {
 	Val     string   `xml:"attr"`
 }
 
-var ganglia_addr = flag.String("ganglia_addr", "foreman.voidetoile.net:8649", "ganglia address")
-var metric_prefix = flag.String("prefix", "ggg.", "prefix for metric names")
-
 var runeMap = map[rune]rune{
 	46: 95, // '.' -> '_'
 	20: 95, // ' ' -> '_'
@@ -101,33 +102,22 @@ func readXmlFromFile(in io.Reader) (gmeta GangliaXml, err error) {
 	return
 }
 
-func printClusterMetrics(riemann raidman.Client, cl *Cluster, ret chan int) {
-	ch := make(chan int)
+func printClusterMetrics(eventsChan chan<- *raidman.Event, cl *Cluster) {
 	log.Print("Reading hosts")
 	for _, hst := range cl.Host {
 		log.Printf("Reading host %s", hst.Name)
-		go printHostMetrics(riemann, *cl, hst, ch)
+		printHostMetrics(eventsChan, cl, &hst)
 	}
-	for _ = range cl.Host {
-		<-ch
-	}
-	ret <- 1
 }
 
-func printHostMetrics(riemann raidman.Client, c Cluster, h Host, ret chan int) {
-	ch := make(chan int)
+func printHostMetrics(eventsChan chan<- *raidman.Event, c *Cluster, h *Host) {
 	log.Printf("Reading %s metrics", h.Name)
 	for _, m := range h.Metric {
-		go printMetric(riemann, c, h, m, ch)
+		printMetric(eventsChan, c, h, &m)
 	}
-	// drain the channel
-	for _ = range h.Metric {
-		<-ch
-	}
-	ret <- 1
 }
 
-func printMetric(riemann raidman.Client, c Cluster, h Host, m Metric, ret chan int) {
+func printMetric(eventsChan chan<- *raidman.Event, c *Cluster, h *Host, m *Metric) {
 	if m.Type != "string" {
 		metricName := strings.Map(graphiteStringMap, m.Name)
 		val, err := strconv.ParseFloat(m.Val, 64)
@@ -151,49 +141,41 @@ func printMetric(riemann raidman.Client, c Cluster, h Host, m Metric, ret chan i
 			Tags:       tags,
 			Time:       time.Now().Unix(),
 		}
-
-		err = riemann.Send(event)
-		if err != nil {
-			log.Printf("%s\n", err)
-			// panic(err)
-		}
+		eventsChan <- event
 	}
-	ret <- 1
 }
 
-func getMetrics(ganglia_conn io.Reader, riemann raidman.Client) {
-	// read xml into memory
-	gmeta, err := readXmlFromFile(ganglia_conn)
-	if err != nil {
-		log.Fatal("xml.unmarshal: ", err)
-	}
-
-	c := make(chan int)
-	cs := 0
+func getMetrics(gmeta *GangliaXml, eventsChan chan<- *raidman.Event) {
 
 	// dispatch goroutines
 	for _, cl := range gmeta.Cluster {
 		log.Print("Reading clusters")
 		/* log.Printf("Cluster %s: %#v\n", cl.Name, cl)*/
-		go printClusterMetrics(riemann, &cl, c)
-		cs++
+		printClusterMetrics(eventsChan, &cl)
 	}
 
 	for _, gr := range gmeta.Grid {
 		for _, cl := range gr.Cluster {
-			go printClusterMetrics(riemann, &cl, c)
-			cs++
+			printClusterMetrics(eventsChan, &cl)
 		}
 	}
 
-	// drain channel
-	for cs > 0 {
-		<-c
-		cs--
-	}
 }
 
-func getClusterMetrics(clusterCfg ClusterConfig, riemann raidman.Client) {
+func connectGanglia(conf *config, hostAddr string) (net.Conn, error) {
+	for i := 0; i <= conf.Retries; i++ {
+		ganglia_conn, err := net.Dial("tcp", hostAddr)
+		if err == nil {
+			log.Println("Connected to: " + hostAddr)
+			return ganglia_conn, nil
+		}
+		log.Println(err)
+		time.Sleep(time.Duration(conf.Timeout) * time.Second)
+	}
+	return nil, errors.New("Can't connect to " + hostAddr)
+}
+
+func (clusterCfg ClusterConfig) GetClusterMetrics(conf *config, eventsChan chan<- *raidman.Event) {
 
 	host := clusterCfg.Host
 	if host == "" {
@@ -205,21 +187,58 @@ func getClusterMetrics(clusterCfg ClusterConfig, riemann raidman.Client) {
 	}
 	interval := clusterCfg.Interval
 	if interval == 0 {
-		interval = 10
+		interval = 30
 	}
 	hostAddr := host + ":" + strconv.Itoa(port)
 	for {
-
-		ganglia_conn, err := net.Dial("tcp", hostAddr)
-		if err != nil {
-			log.Fatal("Dial ganglia: ", err)
+		ganglia_conn, err := connectGanglia(conf, hostAddr)
+		if ganglia_conn == nil {
+			log.Println(err)
+			return
 		}
-		defer ganglia_conn.Close()
-		log.Printf("Connected to ganglia %s ", hostAddr)
+		// read xml into memory
+		gmeta, err := readXmlFromFile(ganglia_conn)
+		if err != nil {
+			log.Fatal("xml.unmarshal: ", err)
+		}
 
-		getMetrics(ganglia_conn, riemann)
+		getMetrics(&gmeta, eventsChan)
 		ganglia_conn.Close()
 		time.Sleep(time.Duration(interval) * time.Second)
+	}
+}
+
+func connectRiemann(conf *config) (*raidman.Client, error) {
+	riemannUrl := conf.RiemannHost + ":" + strconv.Itoa(conf.RiemannPort)
+	for i := 0; i <= conf.Retries; i++ {
+		riemann, err := raidman.Dial("tcp", riemannUrl)
+		if err == nil {
+			log.Println("Connected to: " + riemannUrl)
+			return riemann, nil
+		}
+		log.Println(err)
+		time.Sleep(time.Duration(conf.Timeout) * time.Second)
+	}
+	return nil, errors.New("Can't connect to " + riemannUrl)
+}
+
+func processEvents(conf *config, eventsChan <-chan *raidman.Event, connErrorChan chan<- error) {
+	riemann, err := connectRiemann(conf)
+	if err != nil {
+		connErrorChan <- err
+		return
+	}
+	for {
+		event := <-eventsChan
+		err := riemann.Send(event)
+		if err != nil {
+			riemann.Close()
+			riemann, err = connectRiemann(conf)
+		}
+		if riemann == nil {
+			connErrorChan <- err
+			return
+		}
 	}
 }
 
@@ -227,6 +246,9 @@ func main() {
 	flag.Parse()
 	viper.SetDefault("RiemanHost", "localhost")
 	viper.SetDefault("RiemanPort", 5555)
+	viper.SetDefault("Timeout", 20)
+	viper.SetDefault("Retries", 5)
+	viper.SetDefault("EventQueue", 100)
 	viper.SetConfigName("ggg")            // name of config file (without extension)
 	viper.AddConfigPath("$HOME/projects") // call multiple times to add many search paths
 	viper.ReadInConfig()                  // Find and read the config file
@@ -238,11 +260,6 @@ func main() {
 	if err != nil {
 		log.Fatal("unable to decode into struct, %v", err)
 	}
-	riemann, err := raidman.Dial("tcp", conf.RiemanHost+":"+strconv.Itoa(conf.RiemanPort))
-	if err != nil {
-		panic(err)
-	}
-	defer riemann.Close()
 	var event = &raidman.Event{
 		State:   "success",
 		Host:    "localhost",
@@ -251,16 +268,19 @@ func main() {
 		Ttl:     10,
 	}
 
-	err = riemann.Send(event)
-	if err != nil {
-		panic(err)
-	}
-	ch := make(chan int)
+	connErrorChan := make(chan error)
+	eventsChan := make(chan *raidman.Event, conf.EventQueue)
+	eventsChan <- event
+	go processEvents(&conf, eventsChan, connErrorChan)
+
 	for _, clusterCfg := range conf.Clusters {
 		log.Printf("Reading host %s:%s every %s", clusterCfg.Host, clusterCfg.Port, clusterCfg.Interval)
-		go getClusterMetrics(clusterCfg, *riemann)
+		go clusterCfg.GetClusterMetrics(&conf, eventsChan)
 	}
-	for _ = range conf.Clusters {
-		<-ch
+	for {
+		connError := <-connErrorChan
+		log.Println("Fatal Error:")
+		log.Println(connError)
+		break
 	}
 }
